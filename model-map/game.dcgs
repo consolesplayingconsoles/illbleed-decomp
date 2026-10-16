@@ -1,4 +1,4 @@
-# dcgs v0.6+b7a3306
+# dcgs v0.6+30ea7b8
 # sha1 02aa02096c267356ed712fa77d15594a61c043cc
 # base 0C010000
 # sections models images audio textures
@@ -34582,6 +34582,8 @@ HZ07A000.AFS	33	125800	3888	unknown
 HZ07A000.AFS	34	126800	3888	unknown					
 HZ07A000.AFS	35	127800	3888	unknown					
 HZ07A000.AFS	36	128800	432	unknown					
+SAMPLE.MLT	0	0	1790112	SMLT sound bank					
+DP3SOUND.MLT	0	0	1721120	SMLT sound bank					
 [textures]
 file	number	texture_file	offset	size	width	height	type	format	set
 AMAZON/CHB00A.CGM	0	AMAZON/CHB00A.CGM	40264	3072	64	64	3	1	1

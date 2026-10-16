@@ -11,3 +11,38 @@
 #   textures <model file> <texture file> <texture base> <table addr>   a texture list: number -> place in the file
 #   name <file> <offset> <text>   /   table <addr> <group> <label>   /   sound <file> <entry> <text>   /   image <file> <offset> <text>   names (the viewer writes these)
 # Nothing is needed here to start: with no rules the map still lists every model, grouped by the table that holds it.
+
+# Message files (dumped to text-dump/, shown by the Text tab)
+text /AMAZON/MC_WMES.MEB
+text /AMAZON/ME_ERMES.MEB
+text /AMAZON/ME_HB.MEB
+text /AMAZON/ME_HC.MEB
+text /AMAZON/ME_HK.MEB
+text /AMAZON/ME_HM.MEB
+text /AMAZON/ME_HREG.MEB
+text /AMAZON/ME_HS.MEB
+text /AMAZON/ME_HT.MEB
+text /AMAZON/ME_IMES.MEB
+text /AMAZON/ME_INDA1.MEB
+text /AMAZON/ME_INDA2.MEB
+text /AMAZON/ME_KMES.MEB
+text /AMAZON/ME_REVI.MEB
+text /AMAZON/ME_SHOP.MEB
+text /AMAZON/ME_SMES.MEB
+text /AMAZON/ME_TMES.MEB
+text /AMAZON/MJ_ERMES.MEB
+text /AMAZON/MJ_HB.MEB
+text /AMAZON/MJ_HC.MEB
+text /AMAZON/MJ_HK.MEB
+text /AMAZON/MJ_HM.MEB
+text /AMAZON/MJ_HREG.MEB
+text /AMAZON/MJ_HS.MEB
+text /AMAZON/MJ_HT.MEB
+text /AMAZON/MJ_IMES.MEB
+text /AMAZON/MJ_INDA1.MEB
+text /AMAZON/MJ_INDA2.MEB
+text /AMAZON/MJ_KMES.MEB
+text /AMAZON/MJ_REVI.MEB
+text /AMAZON/MJ_SHOP.MEB
+text /AMAZON/MJ_SMES.MEB
+text /AMAZON/MJ_TMES.MEB

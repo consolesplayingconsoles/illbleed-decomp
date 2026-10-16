@@ -114,6 +114,9 @@ models.txt (curated rules, one per line, `#` comments, `_` is a space in labels)
   structs <addr> <stride> <count> <namestr off> <group> <off:label,...>  records with model pointers
 """
 import bisect
+import io
+import zipfile
+import zlib
 import collections
 import hashlib
 import math
@@ -487,17 +490,321 @@ def stretches(disc, lba, size, path):
         yield start, disc.read(lba + start // 2048, min(STRETCH, size - start)), len(starts) == 1
 
 
+def zip_members(data):
+    """[(offset of the member's local header, name, bytes)] of every member of a ZIP archive that data holds whole (stored
+    or deflated), read through the central directory at its end; [] when data is not one."""
+    if data[:4] != b"PK\x03\x04" or len(data) < 22:
+        return []
+    try:
+        z = zipfile.ZipFile(io.BytesIO(bytes(data)))
+        out = []
+        for info in z.infolist():
+            if info.filename.endswith("/") or info.file_size > MAX_FILE:
+                continue
+            out.append((info.header_offset, info.filename, z.read(info)))
+        return out
+    except (zipfile.BadZipFile, zlib.error, NotImplementedError, struct.error, EOFError):
+        return []
+
+
+def find_md3(data):
+    """[(offset, bytes, surfaces, triangles, vertices, radius)] of every Quake 3 model (MD3: `IDP3`, version 15) in data: the
+    header and every surface must lie inside it, each triangle's vertices inside its surface; the radius is the first
+    frame's."""
+    out, p = [], data.find(b"IDP3")
+    while p >= 0:
+        nxt = p + 4
+        if p % 4 == 0 and p + 108 <= len(data) and struct.unpack_from("<I", data, p + 4)[0] == 15:
+            flags, nframes, ntags, nsurf, nskins, ofsf, ofst, ofss, ofse = struct.unpack_from("<9I", data, p + 72)
+            ok = 0 < nframes <= 4096 and 0 < nsurf <= 64 and ntags <= 64 and 108 <= ofss < ofse <= len(data) - p and ofsf + 56 * nframes <= ofse
+            tris = verts = 0
+            s = p + ofss
+            for _ in range(nsurf if ok else 0):
+                if s + 108 > len(data) or data[s:s + 4] != b"IDP3":
+                    ok = False
+                    break
+                sf, snf, nsh, nv, nt, otri, osh, ost, oxyz, oend = struct.unpack_from("<10I", data, s + 68)
+                if not (0 < nv <= 65535 and 0 < nt <= 65535 and snf == nframes and 108 <= otri and oend >= 108 and s + oend <= p + ofse
+                        and otri + 12 * nt <= oend and ost + 8 * nv <= oend and oxyz + 8 * nv * nframes <= oend):
+                    ok = False
+                    break
+                tris, verts, s = tris + nt, verts + nv, s + oend
+            if ok:
+                out.append((p, ofse, nsurf, tris, verts, struct.unpack_from("<f", data, p + ofsf + 36)[0]))
+                nxt = p + ofse
+        p = data.find(b"IDP3", nxt)
+    return out
+
+
+def is_tag(t):
+    """A body tag: four ASCII letters."""
+    return re.fullmatch(rb"[A-Za-z]{4}", t) is not None
+
+
+
+
+
+def tagged_faces(data, s2, end, ofs48, o52, nv):
+    """The triangles of a mesh group from its display list at body offset ofs48 (8-byte commands up to 0xDF): [(a, b, c)] with
+    vertex numbers in the group's vertex array, or None when there is no list or it does not read. Commands: 0x01 loads n
+    vertices (n at bits 12..19 of the first word, the end slot in bits 1..11, an address in the second) into slots; 0x05
+    is a triangle, 0x06 two triangles, 0x07 a quad as two (three vertex numbers doubled in each word); anything else is
+    skipped. A slot is the vertex of the same number until a load changes it."""
+    if not ofs48 or ofs48 + 8 > end - s2:
+        return None
+    slots, out, p = list(range(nv)), [], s2 + ofs48
+    for _ in range(4096):
+        if p + 8 > end:
+            return None
+        w0, w1 = struct.unpack_from(">II", data, p)
+        cmd = w0 >> 24
+        if cmd == 0xDF:
+            return out
+        if cmd == 0x01:
+            n, vend = (w0 >> 12) & 0xFF, (w0 & 0xFFF) >> 1
+            first = (w1 - o52) // 16 if w1 >= o52 and (w1 - o52) % 16 == 0 else None
+            if first is not None and vend >= n:
+                for k in range(n):
+                    if vend - n + k < len(slots) and first + k < nv:
+                        slots[vend - n + k] = first + k
+        elif cmd in (0x05, 0x06, 0x07):
+            tris = [((w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF)]
+            if cmd in (0x06, 0x07):
+                tris.append(((w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF))
+            for t in tris:
+                a, b, c = (x // 2 for x in t)
+                if max(a, b, c) >= len(slots):
+                    return None
+                out.append((slots[a], slots[b], slots[c]))
+        p += 8
+    return None
+
+
+def tagged_groups(data, s2, end):
+    """The mesh groups of one tagged model whose body is data[s2:end] (pointers count from s2): [(offset of the group's record,
+    vertex count, triangle count, type mode)]. The body starts with a 4-byte tag and a list of node pointers ended by
+    0xFFFFFFFF; a node is 28 bytes (flags, child count at +20, child list at +24); a node whose flags have 0x4000 lists nodes,
+    one of type 0x3064 lists mesh groups. A group is 0x40 bytes: vertex count at +58, type mode at +34 (3 triangles, 4
+    quads, else strips), the number of vertex runs at +32 and their list at +36 (each run's size, +2 per 32 for a strip over
+    32), the display list of its triangles at +48 (`tagged_faces`; groups without one use the type mode), the 16-byte
+    vertices at +52."""
+    out, seen = [], set()
+    u32 = lambda o: struct.unpack_from(">I", data, o)[0]
+
+    def node(ptr):
+        if ptr == 0 or ptr in seen or s2 + ptr + 28 > end:
+            return
+        seen.add(ptr)
+        o = s2 + ptr
+        flags, nch, och = u32(o), u32(o + 20), u32(o + 24)
+        if nch > 4096 or s2 + och + 4 * nch > end:
+            return
+        if flags & 0x4000:
+            for i in range(nch):
+                node(u32(s2 + och + 4 * i))
+        elif flags & 0xFFFF == 0x3064:
+            for i in range(nch):
+                g = u32(s2 + och + 4 * i)
+                if s2 + g + 0x40 <= end:
+                    out.append(g)
+    q = s2 + 4
+    while q + 4 <= end and u32(q) != 0xFFFFFFFF and len(seen) < 100000:
+        node(u32(q))
+        q += 4
+    rows = []
+    for g in out:
+        o = s2 + g
+        nruns, mode = struct.unpack_from(">HH", data, o + 32)
+        oruns, o52, nv = u32(o + 36), u32(o + 52), struct.unpack_from(">H", data, o + 58)[0]
+        if not nv or o52 + 16 * nv > end - s2:
+            continue
+        runs = []
+        if oruns:
+            if s2 + oruns + 4 * nruns > end:
+                continue
+            for k in range(nruns):
+                v = u32(s2 + oruns + 4 * k)
+                runs.append(v + 2 * (v // 32) if mode not in (3, 4) and v > 32 else v)
+            if sum(runs) < nv:
+                runs[-1] += nv - sum(runs)
+        else:
+            step = mode if mode in (3, 4) else 1
+            runs = [nv // nruns] * nruns if nruns >= 1 and nv % nruns == 0 and (nv // nruns) % step == 0 else [nv]
+        if sum(runs) != nv:
+            continue
+        faces = tagged_faces(data, s2, end, u32(o + 48), o52, nv)
+        tris = len(faces) if faces is not None else sum(r // 3 if mode == 3 else 2 * (r // 4) if mode == 4 else max(0, r - 2) for r in runs)
+        rows.append((g, nv, tris, mode))
+    return rows
+
+
+def find_prm(data):
+    """[(0, bytes, "PRM", 1, vertices, triangles, radius)] when data is one whole PRM mesh file, else []: two 16-bit counts (polygons,
+    vertices), then 60-byte polygons (a type, a texture, four 16-bit vertex numbers, four colours, four texture coordinate pairs) and 24-byte
+    vertices (a position and a normal, floats), the file being exactly that long. Type bit 0 makes a polygon a quad. The first polygons
+    must name vertices that exist and the first vertices must be sane numbers."""
+    n = len(data)
+    if n < 4 + 60 + 24:
+        return []
+    npoly, nvert = struct.unpack_from("<HH", data, 0)
+    if not (npoly and nvert and 4 + 60 * npoly + 24 * nvert == n):
+        return []
+    tris = 0
+    for i in range(npoly):
+        o = 4 + 60 * i
+        typ, tex, a, b, c, d = struct.unpack_from("<6H", data, o)
+        quad = typ & 1
+        if typ > 0x3FFF or max(a, b, c, d if quad else 0) >= nvert:
+            return []
+        tris += 2 if quad else 1
+    radius = 0.0
+    for i in range(nvert):
+        x, y, z = struct.unpack_from("<3f", data, 4 + 60 * npoly + 24 * i)
+        if not (abs(x) < 1e7 and abs(y) < 1e7 and abs(z) < 1e7):
+            return []
+        radius = max(radius, (x * x + y * y + z * z) ** 0.5)
+    return [(0, n, "PRM", 1, nvert, tris, radius)]
+
+
+def tr4_level(data):
+    """The level bytes of a TR4 level file (`TR4\\0`, three 16-bit texture page counts, then four zlib blocks each led by an unpacked
+    and a packed size: textures of 32 and of 16 bits, miscellaneous textures, the level), or None when it is not one."""
+    if data[:4] != b"TR4\0" or len(data) < 40:
+        return None
+    p = 10
+    try:
+        for i in range(4):
+            usz, csz = struct.unpack_from("<II", data, p)
+            if csz > len(data) - p - 8 or usz > MAX_FILE:
+                return None
+            if i == 3:
+                out = zlib.decompress(data[p + 8:p + 8 + csz])
+                return out if len(out) == usz else None
+            p += 8 + csz
+    except (zlib.error, struct.error):
+        return None
+
+
+def tr4_meshes(lv):
+    """[(pointer, vertices, triangles, radius, rows)] of the distinct meshes of a TR4 level, by pointer, `rows` being (vertices, triangle
+    vertex numbers). The level holds the rooms, the floor data, then the mesh words and their pointer table; a mesh is a centre, a radius,
+    its vertices (three 16-bit coordinates), its normals or lights, its textured rectangles (four vertex numbers, a texture, effects) and
+    its textured triangles (three, a texture, effects)."""
+    n = len(lv)
+    try:
+        u16 = lambda o: struct.unpack_from("<H", lv, o)[0]
+        i16 = lambda o: struct.unpack_from("<h", lv, o)[0]
+        u32 = lambda o: struct.unpack_from("<I", lv, o)[0]
+        if u32(0) != 0:
+            return []
+        q, nrooms = 6, u16(4)
+        for _ in range(nrooms):
+            q += 16 + 4 + 2 * u32(q + 16)
+            q += 2 + 32 * u16(q)
+            q += 4 + 8 * u16(q) * u16(q + 2)
+            q += 4
+            q += 2 + 46 * u16(q)
+            q += 2 + 20 * u16(q)
+            q += 7
+        q += 4 + 2 * u32(q)
+        nwords = u32(q)
+        base = q + 4
+        q = base + 2 * nwords
+        nptr = u32(q)
+        q += 4
+        if not 0 < nptr < 100000 or q + 4 * nptr > n:
+            return []
+        ptrs = sorted(set(struct.unpack_from("<%dI" % nptr, lv, q)))
+        out = []
+        for ptr in ptrs:
+            o = base + ptr
+            nv = i16(o + 10)
+            if ptr >= 2 * nwords or not 0 < nv < 4096:
+                continue
+            verts = [struct.unpack_from("<3h", lv, o + 12 + 6 * i) for i in range(nv)]
+            r = o + 12 + 6 * nv
+            nn = i16(r)
+            r += 2 + (6 * nn if nn > 0 else -2 * nn)
+            tris, ok = [], True
+            nrect = i16(r)
+            r += 2
+            for i in range(max(nrect, 0)):
+                a, b, c, d = struct.unpack_from("<4H", lv, r + 12 * i)
+                ok = ok and max(a, b, c, d) < nv
+                tris += [a, b, c, a, c, d]
+            r += 12 * max(nrect, 0)
+            ntri = i16(r)
+            r += 2
+            for i in range(max(ntri, 0)):
+                a, b, c = struct.unpack_from("<3H", lv, r + 10 * i)
+                ok = ok and max(a, b, c) < nv
+                tris += [a, b, c]
+            if ok and tris:
+                radius = max((x * x + y * y + z * z) ** 0.5 for x, y, z in verts)
+                out.append((ptr, nv, len(tris) // 3, radius, (verts, tris)))
+        return out
+    except struct.error:
+        return []
+
+
+def find_tr4(data):
+    """[(index, bytes, "TR4", 1, vertices, triangles, radius)] for each mesh of a TR4 level file; the index counts the meshes."""
+    lv = tr4_level(data)
+    if lv is None:
+        return []
+    return [(i, 6 * nv + 10 * nt, "TR4", 1, nv, nt, radius) for i, (_, nv, nt, radius, _) in enumerate(tr4_meshes(lv))]
+
+
+def find_tagged(data):
+    """[(offset of the body, bytes, tag, mesh groups, vertices, triangles, radius)] of every model of a model block held at the
+    start of data: a big-endian count, then count + 1 rising offsets that alternate between a pointer-flag section and a
+    body, each body starting with a tag of four letters."""
+    if len(data) < 24:
+        return []
+    n = struct.unpack_from(">I", data, 0)[0]
+    if not 2 <= n <= 4096 or 4 + 4 * (n + 1) > len(data):
+        return []
+    offs = struct.unpack_from(">%dI" % (n + 1), data, 4)
+    if any(offs[i] > offs[i + 1] for i in range(n)) or offs[-1] > len(data) or offs[0] < 4 + 4 * (n + 1):
+        return []
+    pairs = [(offs[2 * i + 1], offs[2 * i + 2]) for i in range(n // 2) if 2 * i + 2 <= n]
+    if sum(1 for a, e in pairs if is_tag(data[a:a + 4])) * 2 < len(pairs):
+        return []
+    out = []
+    for a, e in pairs:
+        if not is_tag(data[a:a + 4]) or e - a < 8:
+            continue
+        groups = tagged_groups(data, a, e)
+        if not groups:
+            continue
+        radius = 0.0
+        for g, nv, tris, mode in groups:
+            lo = struct.unpack_from(">3f", data, a + g + 8)
+            hi = struct.unpack_from(">3f", data, a + g + 20)
+            radius = max([radius] + [abs(x) for x in lo + hi if x == x and abs(x) < 1e9])
+        out.append((a, e - a, data[a:a + 4].decode("ascii"), len(groups), sum(g[1] for g in groups), sum(g[2] for g in groups), radius))
+    return out
+
+
 class ModelScan(object):
     """The models found in the stretches of one file, by offset in the file: a thing in the overlap of two stretches is
     found twice and kept once. A tree's address is that of the file's first byte (its stretch's address minus where the
     stretch starts), so one address serves the whole file."""
 
     def __init__(self):
-        self.flat, self.trees, self.ninja, self.blocks = {}, {}, {}, {}
+        self.flat, self.trees, self.ninja, self.blocks, self.motions, self.md3, self.tagged = {}, {}, {}, {}, {}, {}, {}
 
     def add(self, start, data):
         for at, name, dec, _ in pressed_blocks(data):
             self.blocks.setdefault(start + at, (name, dec))
+        if start == 0:                                     # the members of a ZIP archive are streams of their own too
+            for at, name, dec in zip_members(data):
+                self.blocks.setdefault(at, (name, dec))
+        for x in find_md3(data):
+            self.md3.setdefault(start + x[0], (start + x[0],) + tuple(x[1:]))
+        if start == 0:
+            for x in find_tagged(data) + find_prm(data) + find_tr4(data):
+                self.tagged.setdefault(x[0], x)
         for x in find_models(data):
             self.flat.setdefault(start + x[0], (start + x[0],) + tuple(x[1:]))
         trees, base = find_object_trees(data)
@@ -505,6 +812,16 @@ class ModelScan(object):
             self.trees.setdefault(start + off, (start + off, objs, radius, base - start))
         for off, nbytes, objs, radius, names in find_ninja(data):
             self.ninja.setdefault(start + off, (start + off, nbytes, objs, radius, names))
+        for x in find_motions(data):
+            self.motions.setdefault(start + x[0], (start + x[0],) + tuple(x[1:]))
+
+    def tagged_result(self):
+        """The models of a model block, sorted by offset: (offset, bytes, tag, groups, vertices, triangles, radius)."""
+        return [self.tagged[k] for k in sorted(self.tagged)]
+
+    def md3_result(self):
+        """The Quake 3 models (MD3), sorted by offset: (offset, bytes, surfaces, triangles, vertices, radius)."""
+        return [self.md3[k] for k in sorted(self.md3)]
 
     def result(self):
         """(flat models, trees, Ninja chunk models), each sorted by offset: flat (offset, records, strip bytes, radius,
@@ -514,12 +831,17 @@ class ModelScan(object):
                 [self.ninja[k] for k in sorted(self.ninja)])
 
 
-def scan_buffer(data):
-    """ModelScan.result() of a whole file held in memory, scanned in stretches as a disc file is."""
+def scan_models(data):
+    """The ModelScan of a whole file held in memory, scanned in stretches as a disc file is."""
     scan = ModelScan()
     for start in stretch_starts(len(data)):
         scan.add(start, data[start:start + STRETCH])
-    return scan.result()
+    return scan
+
+
+def scan_buffer(data):
+    """ModelScan.result() of a whole file held in memory, scanned in stretches as a disc file is."""
+    return scan_models(data).result()
 
 
 def block_path(path, at):
@@ -615,23 +937,26 @@ def pvm_entries(data):
 
 def njm_read(data, nodes=None):
     """(frames, kinds, nodes, moving) of a Ninja motion (an NMDM chunk: frame count, the kinds of keys, then per object
-    one pointer and one count per kind; a key is a frame number and three values), or None when it is not one or carries
-    kinds other than position, angle and scale. `nodes` is the object count of the model it animates, when known (else
-    the entries are counted as far as their pointers and counts are plausible)."""
+    one pointer and one count per kind; a key is a frame number and three values: a quaternion's is a frame number and four),
+    or None when it is not one or carries kinds other than position, angle (or quaternion) and scale. The kinds come in this
+    order: position, rotation, scale. `nodes` is the object count of the model it animates, when known (else the entries
+    are counted as far as their pointers and counts are plausible)."""
     if len(data) < 24 or data[:4] != b"NMDM":
         return None
     size = struct.unpack_from("<I", data, 4)[0]
     mdata, frames, typ, _ = struct.unpack_from("<IIHH", data, 8)
-    if typ & ~7 or not typ or size + 8 > len(data) or mdata & 3:
+    if typ & ~0x2007 or not typ or typ & 2 and typ & 0x2000 or size + 8 > len(data) or mdata & 3:
         return None
-    kinds = [n for n, bit in (("position", 1), ("angle", 2), ("scale", 4)) if typ & bit]
+    slots = [(n, bit) for n, bit in (("position", 1), ("angle", 2), ("quaternion", 0x2000), ("scale", 4)) if typ & bit]
+    kinds = [n for n, _ in slots]
+    key = [20 if n == "quaternion" else 16 for n in kinds]
     t = len(kinds)
     count = 0
     while mdata + 8 * t * (count + 1) <= size and (nodes is None or count < nodes):
         o = 8 + mdata + 8 * t * count
         ps = struct.unpack_from("<%dI" % t, data, o)
         ns = struct.unpack_from("<%dI" % t, data, o + 4 * t)
-        if not all((q == 0 and n == 0) or (0 < q and q + 16 * n <= size and 0 < n <= frames + 1) for q, n in zip(ps, ns)):
+        if not all((q == 0 and n == 0) or (0 < q and q + k * n <= size and 0 < n <= frames + 1) for q, n, k in zip(ps, ns, key)):
             break
         count += 1
     if not count or (nodes is not None and count != nodes):
@@ -641,13 +966,29 @@ def njm_read(data, nodes=None):
         o = 8 + mdata + 8 * t * i
         ps = struct.unpack_from("<%dI" % t, data, o)
         ns = struct.unpack_from("<%dI" % t, data, o + 4 * t)
-        for q, n in zip(ps, ns):
-            fr = [struct.unpack_from("<I", data, 8 + q + 16 * j)[0] for j in range(n)]
+        for q, n, k in zip(ps, ns, key):
+            fr = [struct.unpack_from("<I", data, 8 + q + k * j)[0] for j in range(n)]
             if fr != sorted(fr) or (fr and fr[-1] > frames):
                 return None
         if any(n > 1 for n in ns):
             moving += 1
     return frames, kinds, count, moving
+
+
+def find_motions(data):
+    """[(offset, bytes, frames, kinds, nodes, moving)] of every Ninja motion (an NMDM chunk, see njm_read) in data, wherever it
+    sits: a motion is kept inside the model file it animates as often as it is a file of its own. The model it animates is
+    one of the same file with as many objects as the motion has nodes."""
+    out, p = [], data.find(b"NMDM")
+    while p >= 0:
+        if p % 4 == 0 and p + 24 <= len(data):
+            size = struct.unpack_from("<I", data, p + 4)[0]
+            if size + 8 <= len(data) - p:
+                r = njm_read(data[p:p + 8 + size])
+                if r:
+                    out.append((p, 8 + size, r[0], "+".join(r[1]), r[2], r[3]))
+        p = data.find(b"NMDM", p + 4)
+    return out
 
 
 def ninja_motion_rows(disc, objects):
@@ -686,6 +1027,25 @@ def pvrt_at(data, p):
     return w, h, pf, dt, ln + 8
 
 
+def tr4_pages(data):
+    """[(offset, "tr4", 256, 256, page, block, bytes, "")] for each texture page of a TR4 level file: its zlib blocks of 32-bit pages
+    (blocks 0 and 2, four bytes a pixel) and of 16-bit pages (block 1, two bytes a pixel), 256 x 256 each; `offset` is where the page's
+    block starts in the file plus the page's number (so each page has an offset of its own), `page` its number in it, `block` 0, 1 or 2."""
+    if data[:4] != b"TR4\0" or len(data) < 40:
+        return []
+    out, p = [], 10
+    for blk in range(3):
+        if p + 10 > len(data):
+            break
+        usz, csz = struct.unpack_from("<II", data, p)
+        bpp = 2 if blk == 1 else 4
+        if csz > len(data) - p - 8 or data[p + 8] != 0x78 or usz % (256 * 256 * bpp):
+            break
+        out += [(p + k, "tr4", 256, 256, k, blk, 256 * 256 * bpp, "") for k in range(usz // (256 * 256 * bpp))]
+        p += 8 + csz
+    return out
+
+
 def find_pictures(data, base=0, whole=True):
     """[(offset, kind, width, height, type, format, bytes, name)] of every picture in data: a whole GIF, JPEG or PNG file,
     or PVRT chunks anywhere (named by a PVM archive's header when data starts with one). With whole false, data is a
@@ -704,6 +1064,8 @@ def find_pictures(data, base=0, whole=True):
                 if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
                     return [(0, "jpg", data[p + 7] << 8 | data[p + 8], data[p + 5] << 8 | data[p + 6], 0, 0, len(data), "")]
                 p += 2 + ln
+    if whole and data[:4] == b"TR4\0":
+        return tr4_pages(data)
     names = pvm_names(data) if whole else []
     out, p = [], data.find(b"PVRT")
     while 0 <= p:
@@ -738,6 +1100,9 @@ def image_rows(disc, rules):
                 at.setdefault(x[0], x)
             for off, _, dec, _ in pressed_blocks(data):
                 blocks.setdefault(start + off, dec)
+            if start == 0:
+                for off, _, dec in zip_members(data):
+                    blocks.setdefault(off, dec)
         add(path.lstrip("/"), [at[k] for k in sorted(at)])
         for off in sorted(blocks):                         # the pictures inside each `PRESSED` stream
             add(block_path(path, off), find_pictures(blocks[off], 0, True))
@@ -748,11 +1113,76 @@ def image_rows(disc, rules):
     return rows
 
 
-def ninja_texture_rows(disc, ninja):
+def own_textures(data, model_offsets):
+    """For a file that holds Ninja models together with their PVR textures (each model's `NJTL` name list, then the `PVRT`
+    chunks of all of them at the end): ([(list number, texture number, pixel offset, bytes, width, height, type, format)],
+    {model offset: list number}), or None when the names of all the lists, joined in file order, do not count the file's
+    PVRT chunks exactly. List numbers start at 1; a model takes the last list before it; texture n of list k is the chunk
+    after those of the lists before it."""
+    lists, p = [], 0
+    while True:
+        p = data.find(b"NJ", p)
+        if p < 0 or p + 8 > len(data):
+            break
+        if p % 4:
+            p += 1
+            continue
+        size = struct.unpack_from("<I", data, p + 4)[0]
+        if data[p + 2:p + 4] == b"TL" and p + 8 + size <= len(data):
+            names = ninja_names(data, p + 8, size)
+            if names:
+                lists.append((p, names))
+        p += 4
+    chunks = pvm_entries(data)
+    if not lists or len(chunks) != sum(len(n) for _, n in lists):
+        return None
+    rows, base, first = [], 0, {}
+    for k, (pos, names) in enumerate(lists, 1):
+        first[k] = pos
+        for n in range(len(names)):
+            e = chunks[base + n]
+            rows.append((k, n, e[1], e[2], e[3], e[4], e[5], e[6]))
+        base += len(names)
+    sets = {}
+    for o in model_offsets:
+        before = [k for k in first if first[k] < o]
+        if before:
+            sets[o] = max(before)
+    return rows, sets
+
+
+def own_texture_rows(disc, ninja_models):
+    """([texture rows with their set column], the set of model files they cover) for Ninja models whose file also holds their
+    textures (`own_textures`); each such model's texset is marked with its list number."""
+    files = dict((path.lstrip("/").upper(), (lba, size, path)) for lba, size, path in disc.files())
+    by_file = collections.defaultdict(list)
+    for m in ninja_models:
+        if m["file"].upper() in files:
+            by_file[m["file"].upper()].append(m)
+    rows, handled = [], set()
+    for f in sorted(by_file):
+        lba, size, path = files[f]
+        if size > MAX_FILE and not path.upper().endswith(".PRS"):
+            continue
+        got = own_textures(file_data(disc, lba, size, path), [m["offset"] for m in by_file[f]])
+        if not got:
+            continue
+        trows, sets = got
+        handled.add(f)
+        for m in by_file[f]:
+            if m["offset"] in sets:
+                m["texset"] = str(sets[m["offset"]])
+        rows += [[f, str(n), f, "%x" % off, str(nb), str(w), str(h), "%x" % dt, str(pf), str(k)] for k, n, off, nb, w, h, dt, pf in trows]
+    if handled:
+        print("textures: %d model files carry their own textures, %d rows" % (len(handled), len(rows)))
+    return rows, handled
+
+
+def ninja_texture_rows(disc, ninja, skip=()):
     """Rows for [textures] for Ninja models: texture n of a model file is the texture its NJTL names, found in the PVM
     named after the model file, else a PVR file of that name (beside it first), else any PVM texture of that name.
     A model with no NJTL takes the textures of the PVM named after its file in order (texture n = its n-th), else the
-    PVR named after its file as texture 0."""
+    PVR named after its file as texture 0. Files in `skip` (those whose models carry their own textures) are left out."""
     files = dict((path.lstrip("/").upper(), (lba, size)) for lba, size, path in disc.files())
     cache = {}
 
@@ -765,6 +1195,8 @@ def ninja_texture_rows(disc, ninja):
     pvms = sorted(f for f in files if f.endswith(".PVM"))
     rows = []
     for mfile, names in sorted(ninja.items()):
+        if mfile in skip:
+            continue
         stem, d = mfile.rsplit(".", 1)[0], (mfile.rsplit("/", 1)[0] + "/" if "/" in mfile else "")
         own = stem + ".PVM"
         if not names:
@@ -817,7 +1249,7 @@ def find_models(data):
             j = nxt[j]
         if all(record_ok(w, r) for r in chain):
             radius = f32(w[i - 1])
-            if radius == radius and abs(radius) < 1e9:
+            if radius == radius and 1e-4 <= abs(radius) < 1e9:      # a model of no size (a radius of 0 or 1e-30) is stray data, found inside audio files
                 tex = max(struct.unpack("<i", struct.pack("<I", w[r + 8]))[0] for r in chain)
                 out.append(((i - 6) * 4, len(chain), sum(w[r + 19] for r in chain), radius, tex))
     return out
@@ -1297,10 +1729,60 @@ def adx_info(b):
     return ("AHX" if enc >= 0x10 else "ADX"), ch, rate, samples
 
 
+def wav_info(b):
+    """("WAV", channels, rate, samples) of a RIFF WAVE file whose header is at the start of b (the fmt chunk first, any format
+    tag: the tag and bits per sample are not checked, a viewer decides what it can play), or None."""
+    if len(b) < 44 or b[:4] != b"RIFF" or b[8:12] != b"WAVE" or b[12:16] != b"fmt ":
+        return None
+    ch, rate = struct.unpack_from("<HI", b, 22)
+    bits = struct.unpack_from("<H", b, 34)[0]
+    at = b.find(b"data", 36, 64)          # not at the fmt chunk's declared end: some files carry two stray bytes before it
+    if not 1 <= ch <= 8 or not 4000 <= rate <= 192000 or at < 0 or at + 8 > len(b):
+        return None
+    data = struct.unpack_from("<I", b, at + 4)[0]
+    return "WAV", ch, rate, data * 8 // (bits * ch) if bits else 0
+
+
+def str_info(b):
+    """("STR", None, rate, None) of a sample stream file whose header is a version of 1, the sample rate and a 4 (the next
+    word, 0x2000 in the files seen, is the block size), or None. Listed, not decoded."""
+    if len(b) < 16:
+        return None
+    version, rate, four = struct.unpack_from("<3I", b, 0)
+    if version != 1 or four != 4 or not 4000 <= rate <= 192000:
+        return None
+    return "STR", None, rate, None
+
+
+def rat_entries(size, head, read):
+    """[(index, name, type, tag, bytes, offset)] of a RAT archive of `size` bytes (`RAT\\0`, a version, an entry count, then 32 byte
+    entries from byte 32: an 8 byte name, a 4 byte type, a 4 byte tag, the size, two dates, the offset), up to the first entry
+    that is not one: a type of 3 or 4 capitals and a name and a body that lie inside the file; [] when it is not one."""
+    if head[:4] != b"RAT\0" or len(head) < 12:
+        return []
+    n = struct.unpack_from("<I", head, 8)[0]
+    if not 0 < n < 100000 or 32 + 32 * n > size:
+        return []
+    table, out = read(0, 32 + 32 * n), []
+    for i in range(n):
+        o = 32 + 32 * i
+        name, typ, tag = (table[o + a:o + b].split(b"\0")[0] for a, b in ((0, 8), (8, 12), (12, 16)))
+        sz, off = struct.unpack_from("<I", table, o + 16)[0], struct.unpack_from("<I", table, o + 28)[0]
+        if not (name and 3 <= len(typ) <= 4 and typ.isalpha() and typ.isupper()) or off + sz > size:
+            break
+        out.append((i, name.decode("latin1"), typ.decode("ascii"), tag.decode("latin1"), sz, off))
+    return out
+
+
+def rat_sounds(size, head, read):
+    """The sound effects of a RAT archive: its entries of type SDFX, listed, not decoded."""
+    return [(i, off, sz, "RAT sound (" + tag + ")", None, None, None) for i, _, typ, tag, sz, off in rat_entries(size, head, read) if typ == "SDFX"]
+
+
 def audio_file_rows(size, head, read):
     """[(index, offset, bytes, format, channels, rate, samples)] (the last three None where unknown) of the sounds in one file of `size` bytes, `head` being its first
     bytes and read(offset, n) any n bytes of it: every ADX / AHX stream of an AFS archive (an archive with none holds
-    something else and has no rows), a file that is one ADX / AHX stream, or a DTPK sound bank (listed, not opened)."""
+    something else and has no rows), a file that is one ADX / AHX stream, a RIFF WAVE file, a sample stream file (STR), the sound effects of a RAT archive (listed), or a DTPK or Sega SMLT / SMPB sound bank (listed, not opened)."""
     if head[:4] == b"AFS\0":
         n = struct.unpack("<I", head[4:8])[0]
         if not 0 < n < 100000:
@@ -1313,11 +1795,21 @@ def audio_file_rows(size, head, read):
             info = adx_info(read(off, 16))
             rows.append((i, off, sz) + (info if info else ("unknown", None, None, None)))
         return rows if any(r[3] in ("ADX", "AHX") for r in rows) else []
+    if head[:4] == b"RAT\0":
+        return rat_sounds(size, head, read)
     info = adx_info(head)
     if info:
         return [(0, 0, size) + info]
+    wav = wav_info(head)
+    if wav:
+        return [(0, 0, size) + wav]
     if head[:4] == b"DTPK":
         return [(0, 0, size, "DTPK sound bank", None, None, None)]
+    stream = str_info(head)
+    if stream:
+        return [(0, 0, size) + stream]
+    if head[:4] in (b"SMLT", b"SMPB"):            # Sega's sound driver files: a multi bank (SMLT) or a program bank (SMPB), listed, not opened
+        return [(0, 0, size, head[:4].decode("ascii") + " sound bank", None, None, None)]
     return []
 
 
@@ -1380,10 +1872,23 @@ def main():
     maxtex = {}                                       # model file -> its highest texture number
     ninja = {}                                        # Ninja model file (disc path) -> its texture names
     ninja_objs = {}                                   # Ninja model file -> the object count of its first model
+    ninja_models = []                                 # the model dicts of every Ninja model
     cand = [v for v in where if 0x0C000000 <= v < 0x0D000000 and v % 4 == 0]
     random.seed(1)
-    def take(path, name, found, trees, nj, say):
+    def take(path, name, found, trees, nj, say, md3=(), tagged=()):
         """Rows for the models found in one file (or one stream of a file: path is then its `file@offset` name)."""
+        for off, nbytes, nsurf, ntris, nverts, radius in md3:
+            models.append({"file": path.lstrip("/"), "offset": off, "records": nsurf, "bytes": nbytes, "radius": radius,
+                           "addr": None, "group": "", "sub": "", "sublabel": "", "name": "", "table": "",
+                           "index": "", "used_by": "", "texset": ""})
+        if md3 and say:
+            print("%-16s %5d Quake 3 models" % (name, len(md3)))
+        for off, nbytes, tag, ngroups, nverts, ntris, radius in tagged:
+            models.append({"file": path.lstrip("/"), "offset": off, "records": ngroups, "bytes": nbytes, "radius": radius,
+                           "addr": None, "group": "", "sub": "", "sublabel": "", "name": "", "table": "",
+                           "index": "", "used_by": "", "texset": ""})
+        if tagged and say:
+            print("%-16s %5d tagged models" % (name, len(tagged)))
         for off, objs, radius, _ in trees:
             models.append({"file": path.lstrip("/"), "offset": off, "records": objs, "bytes": objs * 0x34, "radius": radius,
                            "addr": None, "group": "", "sub": "", "sublabel": "", "name": "", "table": "",
@@ -1395,6 +1900,7 @@ def main():
             models.append({"file": path.lstrip("/"), "offset": off, "records": objs, "bytes": nbytes, "radius": radius,
                            "addr": None, "group": "", "sub": "", "sublabel": "", "name": "", "table": "",
                            "index": "", "used_by": "", "texset": ""})
+            ninja_models.append(models[-1])
             ninja.setdefault(path.lstrip("/").upper(), names)
         if nj and say:
             print("%-16s %5d Ninja models" % (name, len(nj)))
@@ -1421,12 +1927,13 @@ def main():
         scan = ModelScan()
         for start, data, _ in stretches(disc, lba, size, path):
             scan.add(start, data)
-        take(path, name, *scan.result(), say=True)
-        for at in sorted(scan.blocks):                     # each `PRESSED` stream is scanned as a file of its own
+        take(path, name, *scan.result(), say=True, md3=scan.md3_result(), tagged=scan.tagged_result())
+        for at in sorted(scan.blocks):                     # each `PRESSED` stream, each ZIP member is scanned as a file of its own
             vname = block_path(path, at)
-            take(vname, vname, *scan_buffer(scan.blocks[at][1]), say=False)
+            sub = scan_models(scan.blocks[at][1])
+            take(vname, vname, *sub.result(), say=False, md3=sub.md3_result(), tagged=sub.tagged_result())
         if scan.blocks:
-            print("%-16s %5d compressed streams" % (name, len(scan.blocks)))
+            print("%-16s %5d streams inside" % (name, len(scan.blocks)))
     by_addr = {m["addr"]: m for m in models if m["addr"]}
 
     # 2. tables: runs of words that are model pointers (or null), found from each model's references
@@ -1560,7 +2067,9 @@ def main():
     sha = hashlib.sha1(exe).hexdigest()
     tex = [row + [""] for row in texture_rows(rules, disc, exe, base, maxtex)]
     tex += texture_set_rows(rules, disc, exe, base, ptr_at, by_addr)
-    tex += [row + [""] for row in ninja_texture_rows(disc, ninja)]
+    own, handled = own_texture_rows(disc, ninja_models)
+    tex += own
+    tex += [row + [""] for row in ninja_texture_rows(disc, ninja, handled)]
     sections = [("models", "file\toffset\tbytes\trecords\tradius\tgroup\tsub\tsublabel\tname\ttable\tindex\tused_by\ttexset", [
         "%s\t%x\t%d\t%d\t%.3f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
             m["file"], m["offset"], m["bytes"], m["records"], m["radius"], m["group"], m["sub"], m["sublabel"], m["name"],
