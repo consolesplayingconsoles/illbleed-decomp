@@ -1,5 +1,7 @@
 # Illbleed decomp (kick-off)
 
+![decomp progress](badge.svg)
+
 A decompilation of the Dreamcast **Illbleed**, in progress. It rebuilds the game's executable
 byte for byte from one assembly file per function (the baseline the build keeps checking), with
 2049 of its 4245 functions named so far. A function is **done** when its C behaves like the
