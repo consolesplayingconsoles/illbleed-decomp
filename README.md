@@ -1,5 +1,11 @@
 # Illbleed decomp (kick-off)
 
+**This is not an active decomp, but a proof of concept that a Dreamcast game can be rebuilt from source with a translation in it.**
+
+It was built with V1 of [dc-decomp-kickoff](https://github.com/consolesplayingconsoles/dc-decomp-kickoff); to start your own Dreamcast decomp project, use that repository, which holds the latest version.
+
+Because the executable is reassembled function by function instead of patched in place, translated text no longer has to match the length of the Japanese original or squeeze into the same bytes. The historic constraint of fitting a translation into the original memory layout does not apply here.
+
 ![decomp progress](badge.svg?p=0.0)
 
 **Explore this decomp project with [Shuriken Explorer](https://consolesplayingconsoles.github.io/dc-shuriken-explorer/) and see the game's models, skeletons, animations, textures, images, sounds, text and side-by-side C and assembly code directly in your browser.**
